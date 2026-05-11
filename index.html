@@ -8,9 +8,8 @@
 
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-  import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, increment, query, orderBy, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, increment, query, orderBy, getDocs, deleteDoc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
-  // ✅ 여기에 Firebase 설정을 붙여넣으세요
   const firebaseConfig = {
     apiKey: "AIzaSyAQwN8P5d7HpUu42hTrh3I_rAxFr_IHgDI",
     authDomain: "eumseong-middle-school-9d6c9.firebaseapp.com",
@@ -23,13 +22,22 @@
   const app = initializeApp(firebaseConfig);
   const db = getFirestore(app);
 
+  // ✅ 관리자 비밀번호 (원하시면 변경하세요)
+  const ADMIN_PW = "1234";
+
   let votedId = localStorage.getItem('votedPhotoId');
   let nameVerified = false;
   let verifiedName = '';
   let pendingDataUrl = null;
   let photos = [];
+  let isAdmin = false;
+  let editingId = null;
+  let editingDataUrl = null;
 
-  // 실시간 사진 목록 구독
+  // 설정 (투표/업로드 중지 여부)
+  let settings = { votingOpen: true, uploadOpen: true };
+
+  // 실시간 사진 목록
   const q = query(collection(db, "photos"), orderBy("createdAt", "desc"));
   onSnapshot(q, (snapshot) => {
     photos = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -38,13 +46,62 @@
     renderAdminList();
   });
 
+  // 설정 실시간 구독
+  onSnapshot(doc(db, "settings", "global"), (snap) => {
+    if (snap.exists()) {
+      settings = snap.data();
+      updateStatusBanner();
+    }
+  });
+
+  function updateStatusBanner() {
+    const vb = document.getElementById('vote-banner');
+    const ub = document.getElementById('upload-banner');
+    if (vb) vb.style.display = settings.votingOpen ? 'none' : 'flex';
+    if (ub) ub.style.display = settings.uploadOpen ? 'none' : 'flex';
+    renderVote();
+  }
+
+  // 관리자 로그인
+  window.adminLogin = () => {
+    const pw = document.getElementById('admin-pw').value;
+    if (pw === ADMIN_PW) {
+      isAdmin = true;
+      document.getElementById('admin-login-box').style.display = 'none';
+      document.getElementById('admin-panel').style.display = 'block';
+      renderAdminList();
+      loadSettings();
+    } else {
+      showToast('비밀번호가 틀렸습니다');
+    }
+  };
+
+  async function loadSettings() {
+    const snap = await getDoc(doc(db, "settings", "global"));
+    if (snap.exists()) settings = snap.data();
+    document.getElementById('toggle-vote').checked = settings.votingOpen !== false;
+    document.getElementById('toggle-upload').checked = settings.uploadOpen !== false;
+  }
+
+  window.toggleVoting = async () => {
+    settings.votingOpen = document.getElementById('toggle-vote').checked;
+    await setDoc(doc(db, "settings", "global"), settings);
+    showToast(settings.votingOpen ? '투표가 열렸습니다' : '투표가 중지되었습니다');
+  };
+
+  window.toggleUpload = async () => {
+    settings.uploadOpen = document.getElementById('toggle-upload').checked;
+    await setDoc(doc(db, "settings", "global"), settings);
+    showToast(settings.uploadOpen ? '사진 업로드가 열렸습니다' : '사진 업로드가 중지되었습니다');
+  };
+
   // 이름 중복 확인
   window.checkName = async () => {
     const name = document.getElementById('uploader-name').value.trim();
     const statusEl = document.getElementById('name-status');
     if (!name) { showToast('이름을 입력해 주세요'); return; }
     const snap = await getDocs(collection(db, "photos"));
-    const exists = snap.docs.some(d => d.data().uploader === name);
+    const exists = snap.docs.some(d => d.data().uploader === name && d.id !== editingId);
     if (exists) {
       statusEl.innerHTML = `<span class="pill pill-err">❌ ${name} 님은 이미 사진을 등록하셨습니다</span>`;
       lockUpload();
@@ -55,42 +112,70 @@
     }
   };
 
-  // 사진 등록 (Storage 없이 base64로 Firestore에 직접 저장)
+  // 사진 등록
   window.addPhoto = async () => {
     if (!nameVerified) { showToast('이름 확인을 먼저 해주세요'); return; }
     const title = document.getElementById('photo-title').value.trim();
     const desc = document.getElementById('photo-desc').value.trim();
     if (!title) { showToast('사진 제목을 입력해 주세요'); return; }
-    if (!pendingDataUrl) { showToast('사진을 선택해 주세요'); return; }
 
     const btn = document.getElementById('submit-btn');
-    btn.disabled = true; btn.textContent = '등록 중...';
+    btn.disabled = true; btn.textContent = editingId ? '수정 중...' : '등록 중...';
 
     try {
-      await addDoc(collection(db, "photos"), {
-        title, desc,
-        uploader: verifiedName,
-        imageUrl: pendingDataUrl,
-        votes: 0,
-        createdAt: new Date()
-      });
-      showToast(`${verifiedName} 님의 사진이 등록되었습니다! 🎉`);
+      if (editingId) {
+        // 수정
+        const updateData = { title, desc, uploader: verifiedName };
+        if (editingDataUrl) updateData.imageUrl = editingDataUrl;
+        await updateDoc(doc(db, "photos", editingId), updateData);
+        showToast('사진이 수정되었습니다! ✏️');
+        editingId = null; editingDataUrl = null;
+        document.getElementById('submit-btn').textContent = '사진 등록';
+        document.getElementById('cancel-edit-btn').style.display = 'none';
+        document.getElementById('form-title').textContent = '📸 사진 업로드';
+      } else {
+        // 신규 등록
+        if (!pendingDataUrl) { showToast('사진을 선택해 주세요'); btn.disabled = false; btn.textContent = '사진 등록'; return; }
+        await addDoc(collection(db, "photos"), {
+          title, desc, uploader: verifiedName,
+          imageUrl: pendingDataUrl, votes: 0,
+          createdAt: new Date()
+        });
+        showToast(`${verifiedName} 님의 사진이 등록되었습니다! 🎉`);
+      }
       resetForm();
     } catch (e) {
       console.error(e);
-      showToast('등록 중 오류가 발생했습니다. 사진 용량을 줄여보세요.');
+      showToast('오류가 발생했습니다. 다시 시도해 주세요.');
     }
-    btn.disabled = false; btn.textContent = '사진 등록';
+    btn.disabled = false;
+    btn.textContent = '사진 등록';
   };
 
   // 투표
   window.vote = async (id) => {
-    if (votedId) { showToast('이미 투표하셨습니다!'); return; }
+    if (!settings.votingOpen) { showToast('현재 투표가 중지되어 있습니다'); return; }
+    if (votedId === id) { showToast('이미 이 사진에 투표하셨습니다'); return; }
+    if (votedId) {
+      // 기존 투표 취소 후 새로 투표
+      await updateDoc(doc(db, "photos", votedId), { votes: increment(-1) });
+    }
     await updateDoc(doc(db, "photos", id), { votes: increment(1) });
     votedId = id;
     localStorage.setItem('votedPhotoId', id);
     renderVote();
-    showToast('투표 완료! 소중한 한 표 감사합니다 🎉');
+    showToast('투표 완료! 🎉');
+  };
+
+  // 투표 취소
+  window.cancelVote = async () => {
+    if (!votedId) return;
+    if (!confirm('투표를 취소하시겠습니까?')) return;
+    await updateDoc(doc(db, "photos", votedId), { votes: increment(-1) });
+    votedId = null;
+    localStorage.removeItem('votedPhotoId');
+    renderVote();
+    showToast('투표가 취소되었습니다');
   };
 
   // 사진 삭제
@@ -101,7 +186,37 @@
     showToast('삭제되었습니다');
   };
 
-  // 파일 선택 → 리사이즈 후 base64 변환
+  // 사진 수정 시작
+  window.startEdit = (id) => {
+    const p = photos.find(x => x.id === id);
+    if (!p) return;
+    editingId = id;
+    switchTab('upload');
+    document.getElementById('uploader-name').value = p.uploader;
+    document.getElementById('photo-title').value = p.title;
+    document.getElementById('photo-desc').value = p.desc || '';
+    document.getElementById('preview').src = p.imageUrl;
+    document.getElementById('preview').style.display = 'block';
+    document.getElementById('name-status').innerHTML = `<span class="pill pill-ok">✅ ${p.uploader} 님 (수정 중)</span>`;
+    document.getElementById('form-title').textContent = '✏️ 사진 수정';
+    document.getElementById('submit-btn').textContent = '수정 완료';
+    document.getElementById('cancel-edit-btn').style.display = 'inline-flex';
+    document.getElementById('upload-section').style.opacity = '1';
+    document.getElementById('upload-section').style.pointerEvents = 'auto';
+    document.getElementById('submit-btn').disabled = false;
+    nameVerified = true; verifiedName = p.uploader;
+    window.scrollTo(0, 0);
+  };
+
+  window.cancelEdit = () => {
+    editingId = null; editingDataUrl = null;
+    document.getElementById('form-title').textContent = '📸 사진 업로드';
+    document.getElementById('submit-btn').textContent = '사진 등록';
+    document.getElementById('cancel-edit-btn').style.display = 'none';
+    resetForm();
+  };
+
+  // 파일 선택 → 리사이즈
   window.handleFile = (input) => {
     const file = input.files[0]; if (!file) return;
     const reader = new FileReader();
@@ -115,8 +230,10 @@
         else if (h > MAX) { w = w * MAX / h; h = MAX; }
         canvas.width = w; canvas.height = h;
         canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-        pendingDataUrl = canvas.toDataURL('image/jpeg', 0.7);
-        document.getElementById('preview').src = pendingDataUrl;
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+        if (editingId) editingDataUrl = dataUrl;
+        else pendingDataUrl = dataUrl;
+        document.getElementById('preview').src = dataUrl;
         document.getElementById('preview').style.display = 'block';
       };
       img.src = e.target.result;
@@ -125,6 +242,7 @@
   };
 
   window.resetNameCheck = () => {
+    if (editingId) return;
     nameVerified = false; verifiedName = '';
     document.getElementById('name-status').innerHTML = '';
     lockUpload();
@@ -154,7 +272,7 @@
 
   window.switchTab = (t) => {
     document.querySelectorAll('.tab').forEach((el, i) =>
-      el.classList.toggle('active', ['vote','result','admin'][i] === t));
+      el.classList.toggle('active', ['vote','result','upload','admin'][i] === t));
     document.querySelectorAll('.section').forEach(el => el.classList.remove('active'));
     document.getElementById('tab-' + t).classList.add('active');
   };
@@ -170,6 +288,8 @@
   function renderVote() {
     const grid = document.getElementById('vote-grid');
     const empty = document.getElementById('vote-empty');
+    const vb = document.getElementById('vote-banner');
+    if (vb) vb.style.display = settings.votingOpen ? 'none' : 'flex';
     if (!photos.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
     empty.style.display = 'none';
     const total = getTotal();
@@ -183,9 +303,12 @@
           <div class="card-desc">📷 ${p.uploader}${p.desc ? ' · ' + p.desc : ''}</div>
           <div class="bar-bg"><div class="bar" style="width:${pct}%"></div></div>
           <div class="vote-meta"><span>${p.votes || 0}표</span><span>${pct}%</span></div>
-          <button class="vote-btn${isVoted ? ' voted-btn' : ''}" onclick="vote('${p.id}')" ${votedId && !isVoted ? 'disabled' : ''}>
-            ${isVoted ? '✓ 투표 완료' : '♥ 투표하기'}
-          </button>
+          ${settings.votingOpen ? `
+            <button class="vote-btn${isVoted ? ' voted-btn' : ''}" onclick="vote('${p.id}')" ${votedId && !isVoted ? 'disabled' : ''}>
+              ${isVoted ? '✓ 투표 완료 (변경 가능)' : '♥ 투표하기'}
+            </button>
+            ${isVoted ? `<button class="cancel-btn" onclick="cancelVote()">✕ 투표 취소</button>` : ''}
+          ` : `<button class="vote-btn" disabled>🚫 투표 중지됨</button>`}
         </div>
       </div>`;
     }).join('');
@@ -197,11 +320,11 @@
     const total = getTotal();
     document.getElementById('stat-photos').textContent = photos.length;
     document.getElementById('stat-votes').textContent = total;
-    const leader = [...photos].sort((a, b) => (b.votes||0) - (a.votes||0))[0];
+    const sorted = [...photos].sort((a, b) => (b.votes||0) - (a.votes||0));
+    const leader = sorted[0];
     document.getElementById('stat-lead').textContent = leader && leader.votes > 0 ? leader.title : '-';
     if (!photos.length) { list.innerHTML = ''; empty.style.display = 'block'; return; }
     empty.style.display = 'none';
-    const sorted = [...photos].sort((a, b) => (b.votes||0) - (a.votes||0));
     const medals = ['🥇','🥈','🥉'];
     list.innerHTML = sorted.map((p, i) => {
       const pct = total ? Math.round((p.votes||0) / total * 100) : 0;
@@ -218,16 +341,20 @@
   }
 
   function renderAdminList() {
-    const el = document.getElementById('admin-registered');
-    if (!photos.length) { el.innerHTML = ''; return; }
+    const el = document.getElementById('admin-photo-list');
+    if (!el) return;
+    if (!photos.length) { el.innerHTML = '<p style="color:#aaa;font-size:14px">등록된 사진이 없습니다</p>'; return; }
     el.innerHTML = `<p class="reg-header">등록된 사진 ${photos.length}장</p>` +
       photos.map(p => `<div class="reg-item">
         <img src="${p.imageUrl}" class="reg-thumb" alt="${p.title}" loading="lazy">
         <div class="reg-info">
           <div class="reg-name">${p.title}</div>
-          <div class="reg-sub">👤 ${p.uploader}${p.desc?' · '+p.desc:''}</div>
+          <div class="reg-sub">👤 ${p.uploader}${p.desc?' · '+p.desc:''} · ${p.votes||0}표</div>
         </div>
-        <button class="btn-del" onclick="deletePhoto('${p.id}')">삭제</button>
+        <div style="display:flex;gap:6px;flex-shrink:0">
+          <button class="btn-edit" onclick="startEdit('${p.id}')">✏️ 수정</button>
+          <button class="btn-del" onclick="deletePhoto('${p.id}')">🗑️ 삭제</button>
+        </div>
       </div>`).join('');
   }
 
@@ -251,13 +378,16 @@
 body{font-family:'Noto Sans KR',sans-serif;background:#f5f5f0;color:#1a1a1a;min-height:100vh}
 .top-bar{background:#fff;border-bottom:1px solid #e8e8e4;padding:0 24px;position:sticky;top:0;z-index:100}
 .top-inner{max-width:960px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;height:56px}
-.logo{font-size:16px;font-weight:700;color:#1a1a1a}
+.logo{font-size:16px;font-weight:700}
 .tabs{display:flex}
-.tab{padding:0 20px;height:56px;display:flex;align-items:center;font-size:14px;font-weight:500;color:#888;border:none;background:transparent;cursor:pointer;border-bottom:2px solid transparent;transition:all 0.15s}
+.tab{padding:0 16px;height:56px;display:flex;align-items:center;font-size:14px;font-weight:500;color:#888;border:none;background:transparent;cursor:pointer;border-bottom:2px solid transparent;transition:all 0.15s;font-family:'Noto Sans KR',sans-serif}
 .tab.active{color:#1a1a1a;border-bottom-color:#1a1a1a}
 .tab:hover:not(.active){color:#444}
 .wrap{max-width:960px;margin:0 auto;padding:32px 24px}
 .section{display:none}.section.active{display:block}
+
+.banner{display:none;align-items:center;gap:10px;background:#fff3cd;border:1px solid #ffc107;border-radius:10px;padding:12px 16px;margin-bottom:20px;font-size:14px;color:#856404;font-weight:500}
+
 .photo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:20px}
 .photo-card{background:#fff;border-radius:12px;overflow:hidden;border:1.5px solid #e8e8e4;transition:border-color 0.2s,transform 0.2s}
 .photo-card:hover{transform:translateY(-2px)}
@@ -269,11 +399,14 @@ body{font-family:'Noto Sans KR',sans-serif;background:#f5f5f0;color:#1a1a1a;min-
 .voted-badge{font-size:11px;color:#1a1a1a;background:#f0f0ec;border-radius:20px;padding:2px 8px;font-weight:500}
 .bar-bg{height:5px;border-radius:3px;background:#f0f0ec;overflow:hidden;margin-bottom:4px}
 .bar{height:100%;border-radius:3px;background:#1a1a1a;transition:width 0.5s}
-.vote-meta{display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:12px}
-.vote-btn{width:100%;padding:10px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;border:1.5px solid #e8e8e4;background:#fff;color:#1a1a1a;transition:all 0.15s;font-family:'Noto Sans KR',sans-serif}
+.vote-meta{display:flex;justify-content:space-between;font-size:12px;color:#aaa;margin-bottom:10px}
+.vote-btn{width:100%;padding:10px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;border:1.5px solid #e8e8e4;background:#fff;color:#1a1a1a;transition:all 0.15s;font-family:'Noto Sans KR',sans-serif;margin-bottom:6px}
 .vote-btn:hover:not(:disabled){background:#f0f0ec;border-color:#1a1a1a}
 .vote-btn.voted-btn{background:#1a1a1a;color:#fff;border-color:#1a1a1a}
 .vote-btn:disabled{opacity:0.4;cursor:not-allowed}
+.cancel-btn{width:100%;padding:8px;border-radius:8px;font-size:12px;font-weight:500;cursor:pointer;border:1.5px solid #fce4e4;background:#fff;color:#c62828;font-family:'Noto Sans KR',sans-serif;transition:all 0.15s}
+.cancel-btn:hover{background:#fce4e4}
+
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:28px}
 .stat{background:#fff;border-radius:12px;padding:20px;text-align:center;border:1px solid #e8e8e4}
 .stat-num{font-size:28px;font-weight:700}
@@ -287,6 +420,7 @@ body{font-family:'Noto Sans KR',sans-serif;background:#f5f5f0;color:#1a1a1a;min-
 .result-name{font-size:15px;font-weight:700}
 .muted{font-weight:400;color:#aaa}
 .result-votes{font-size:15px;font-weight:700;flex-shrink:0;text-align:right}
+
 .card-box{background:#fff;border-radius:12px;border:1px solid #e8e8e4;padding:20px;margin-bottom:16px}
 .card-box-title{font-size:13px;font-weight:700;margin-bottom:14px;color:#444}
 .name-row{display:flex;gap:10px;align-items:flex-end}
@@ -302,32 +436,53 @@ body{font-family:'Noto Sans KR',sans-serif;background:#f5f5f0;color:#1a1a1a;min-
 .upload-area:hover,.upload-area.drag{background:#f8f8f5;border-color:#aaa}
 .upload-area p{font-size:14px;color:#aaa;margin-top:8px}
 .upload-area input{display:none}
-.tip-box{background:#fff8e1;border-radius:8px;padding:10px 14px;font-size:13px;color:#7a5c00;margin-bottom:12px;line-height:1.5}
+.tip-box{background:#fff8e1;border-radius:8px;padding:10px 14px;font-size:13px;color:#7a5c00;margin-bottom:12px}
 #preview{width:100%;max-height:200px;object-fit:cover;border-radius:8px;margin-bottom:12px;display:none;border:1px solid #e8e8e4}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
 #upload-section{transition:opacity 0.2s}
-.btn-row{display:flex;justify-content:flex-end;gap:10px;margin-bottom:24px}
+.btn-row{display:flex;justify-content:flex-end;gap:10px;margin-bottom:24px;flex-wrap:wrap}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:10px 22px;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;border:1.5px solid #e8e8e4;background:#fff;color:#1a1a1a;font-family:'Noto Sans KR',sans-serif;transition:all 0.15s}
 .btn:hover{background:#f0f0ec}
 .btn.primary{background:#1a1a1a;color:#fff;border-color:#1a1a1a}
 .btn.primary:hover{background:#333}
 .btn.primary:disabled{opacity:0.4;cursor:not-allowed}
+.btn.warning{background:#ff6b35;color:#fff;border-color:#ff6b35}
+.btn.warning:hover{background:#e55a2b}
+
+.admin-login{background:#fff;border-radius:12px;border:1px solid #e8e8e4;padding:32px;max-width:360px;margin:0 auto;text-align:center}
+.admin-login h3{font-size:18px;font-weight:700;margin-bottom:6px}
+.admin-login p{font-size:13px;color:#aaa;margin-bottom:20px}
+.admin-login input{width:100%;padding:10px 14px;border-radius:8px;border:1.5px solid #e8e8e4;font-size:14px;font-family:'Noto Sans KR',sans-serif;margin-bottom:12px;text-align:center;letter-spacing:4px}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid #f0f0ec}
+.toggle-row:last-child{border-bottom:none}
+.toggle-label{font-size:14px;font-weight:500}
+.toggle-sub{font-size:12px;color:#aaa;margin-top:2px}
+.toggle{position:relative;width:44px;height:24px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:#ddd;border-radius:24px;cursor:pointer;transition:0.3s}
+.slider:before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:0.3s}
+input:checked+.slider{background:#1a1a1a}
+input:checked+.slider:before{transform:translateX(20px)}
+
 .reg-header{font-size:13px;color:#888;margin-bottom:10px}
 .reg-item{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid #e8e8e4;border-radius:10px;margin-bottom:8px;background:#fff}
 .reg-thumb{width:48px;height:48px;object-fit:cover;border-radius:8px;flex-shrink:0;background:#f0f0ec}
 .reg-info{flex:1;min-width:0}
 .reg-name{font-size:14px;font-weight:700}
 .reg-sub{font-size:12px;color:#aaa;margin-top:2px}
-.btn-del{padding:6px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;border:1.5px solid #fce4e4;background:#fff;color:#c62828;font-family:'Noto Sans KR',sans-serif;flex-shrink:0}
+.btn-del{padding:6px 12px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;border:1.5px solid #fce4e4;background:#fff;color:#c62828;font-family:'Noto Sans KR',sans-serif}
 .btn-del:hover{background:#fce4e4}
+.btn-edit{padding:6px 12px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;border:1.5px solid #e8e8e4;background:#fff;color:#1a1a1a;font-family:'Noto Sans KR',sans-serif}
+.btn-edit:hover{background:#f0f0ec}
 .empty{text-align:center;padding:48px;color:#aaa;font-size:14px}
 .toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#1a1a1a;color:#fff;padding:12px 24px;border-radius:8px;font-size:14px;font-family:'Noto Sans KR',sans-serif;opacity:0;pointer-events:none;transition:opacity 0.2s;z-index:999;white-space:nowrap}
 .toast.show{opacity:1}
 @media(max-width:600px){
-  .top-inner{flex-direction:column;height:auto;padding:12px 0 0}
-  .tabs .tab{padding:0 14px;font-size:13px}
+  .top-inner{flex-direction:column;height:auto;padding:10px 0 0}
+  .tab{padding:0 10px;font-size:12px}
   .form-row{grid-template-columns:1fr}
-  .stats{gap:10px}.stat{padding:14px 8px}.stat-num{font-size:22px}
+  .stats{gap:8px}.stat{padding:12px 6px}.stat-num{font-size:20px}
+  .result-item{flex-wrap:wrap}
 }
 </style>
 </head>
@@ -339,28 +494,35 @@ body{font-family:'Noto Sans KR',sans-serif;background:#f5f5f0;color:#1a1a1a;min-
     <div class="tabs">
       <button class="tab active" onclick="switchTab('vote')">투표하기</button>
       <button class="tab" onclick="switchTab('result')">실시간 결과</button>
-      <button class="tab" onclick="switchTab('admin')">사진 등록</button>
+      <button class="tab" onclick="switchTab('upload')">사진 등록</button>
+      <button class="tab" onclick="switchTab('admin')">관리자</button>
     </div>
   </div>
 </div>
 
 <div class="wrap">
+
+  <!-- 투표 -->
   <div id="tab-vote" class="section active">
+    <div class="banner" id="vote-banner">🚫 현재 투표가 중지되어 있습니다. 관리자가 재개할 때까지 기다려주세요.</div>
     <div id="vote-grid" class="photo-grid"></div>
-    <div id="vote-empty" class="empty">아직 등록된 사진이 없습니다.<br>사진 등록 탭에서 사진을 추가해 주세요.</div>
+    <div id="vote-empty" class="empty">아직 등록된 사진이 없습니다.</div>
   </div>
 
+  <!-- 결과 -->
   <div id="tab-result" class="section">
     <div class="stats">
       <div class="stat"><div class="stat-num" id="stat-photos">0</div><div class="stat-label">등록된 사진</div></div>
       <div class="stat"><div class="stat-num" id="stat-votes">0</div><div class="stat-label">총 투표 수</div></div>
-      <div class="stat"><div class="stat-num" id="stat-lead" style="font-size:16px;padding-top:4px">-</div><div class="stat-label">현재 1위</div></div>
+      <div class="stat"><div class="stat-num" id="stat-lead" style="font-size:15px;padding-top:6px">-</div><div class="stat-label">현재 1위</div></div>
     </div>
     <div id="result-list" class="result-list"></div>
     <div id="result-empty" class="empty" style="display:none">아직 투표 결과가 없습니다.</div>
   </div>
 
-  <div id="tab-admin" class="section">
+  <!-- 사진 등록 -->
+  <div id="tab-upload" class="section">
+    <div class="banner" id="upload-banner">🚫 현재 사진 업로드가 중지되어 있습니다.</div>
     <div class="card-box">
       <div class="card-box-title">👤 이름 확인 — 1인 1사진 제한</div>
       <div class="name-row">
@@ -372,11 +534,10 @@ body{font-family:'Noto Sans KR',sans-serif;background:#f5f5f0;color:#1a1a1a;min-
       </div>
       <div id="name-status"></div>
     </div>
-
     <div id="upload-section" style="opacity:0.4;pointer-events:none">
       <div class="card-box">
-        <div class="card-box-title">📸 사진 업로드</div>
-        <div class="tip-box">💡 사진은 자동으로 압축돼서 올라가요. 용량 걱정 없이 업로드하세요!</div>
+        <div id="form-title" class="card-box-title">📸 사진 업로드</div>
+        <div class="tip-box">💡 사진은 자동으로 압축돼서 올라가요!</div>
         <div class="upload-area" onclick="document.getElementById('file-input').click()" id="upload-area">
           <div style="font-size:32px">☁️</div>
           <p>클릭하거나 사진을 끌어다 놓으세요</p>
@@ -389,16 +550,47 @@ body{font-family:'Noto Sans KR',sans-serif;background:#f5f5f0;color:#1a1a1a;min-
         </div>
       </div>
     </div>
-
     <div class="btn-row">
+      <button class="btn" onclick="cancelEdit()" id="cancel-edit-btn" style="display:none;color:#c62828;border-color:#fce4e4">✕ 수정 취소</button>
       <button class="btn" onclick="resetForm()">초기화</button>
       <button class="btn primary" id="submit-btn" onclick="addPhoto()" disabled>사진 등록</button>
     </div>
-
-    <div id="admin-registered"></div>
   </div>
-</div>
 
+  <!-- 관리자 -->
+  <div id="tab-admin" class="section">
+    <div id="admin-login-box" class="admin-login">
+      <h3>🔐 관리자 로그인</h3>
+      <p>관리자만 접근할 수 있습니다</p>
+      <input type="password" id="admin-pw" placeholder="비밀번호" onkeydown="if(event.key==='Enter')adminLogin()">
+      <button class="btn primary" style="width:100%" onclick="adminLogin()">로그인</button>
+    </div>
+    <div id="admin-panel" style="display:none">
+      <div class="card-box" style="margin-bottom:16px">
+        <div class="card-box-title">⚙️ 투표 / 업로드 제어</div>
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">투표 허용</div>
+            <div class="toggle-sub">끄면 모든 투표가 중지됩니다</div>
+          </div>
+          <label class="toggle"><input type="checkbox" id="toggle-vote" checked onchange="toggleVoting()"><span class="slider"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div>
+            <div class="toggle-label">사진 업로드 허용</div>
+            <div class="toggle-sub">끄면 사진 등록이 중지됩니다</div>
+          </div>
+          <label class="toggle"><input type="checkbox" id="toggle-upload" checked onchange="toggleUpload()"><span class="slider"></span></label>
+        </div>
+      </div>
+      <div class="card-box">
+        <div class="card-box-title">📋 사진 관리</div>
+        <div id="admin-photo-list"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
 <div class="toast" id="toast"></div>
 </body>
 </html>
